@@ -1,0 +1,159 @@
+import pandas as pd
+import numpy as np
+import joblib  # To save/load the trained model
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from imblearn.over_sampling import SMOTE
+
+# Load Dataset
+def load_data(filepath, chunk_size=100000):
+    chunks = []
+    for chunk in pd.read_csv(filepath, chunksize=chunk_size):
+        chunks.append(chunk)
+    df = pd.concat(chunks, ignore_index=True)
+    return df
+
+# Preprocess Data
+def preprocess_data(df):
+    df = df.dropna()
+    df = df.drop_duplicates()
+    
+    # Count transactions per account
+    orig_counts = df['nameOrig'].value_counts().to_dict()
+    dest_counts = df['nameDest'].value_counts().to_dict()
+    df['orig_count'] = df['nameOrig'].map(orig_counts).fillna(0)
+    df['dest_count'] = df['nameDest'].map(dest_counts).fillna(0)
+    
+    df = df.drop(columns=['nameOrig', 'nameDest'])  # Remove raw names
+    
+    # Encode 'type'
+    df['type'] = df['type'].astype('category').cat.codes
+    
+    # Ensure 'isFlaggedFraud' exists
+    if 'isFlaggedFraud' not in df.columns:
+        df['isFlaggedFraud'] = 0
+    
+    # Convert numerical columns
+    float_cols = ['amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'orig_count', 'dest_count', 'isFlaggedFraud']
+    df[float_cols] = df[float_cols].astype(np.float32)
+    df['isFraud'] = df['isFraud'].astype(np.int8)
+    
+    X = df.drop(columns=['isFraud'])
+    y = df['isFraud']
+    
+    # Handle imbalance using SMOTE
+    smote = SMOTE(sampling_strategy=0.05, random_state=42)
+    X_sample, y_sample = X.sample(n=100000, random_state=42), y.sample(n=100000, random_state=42)
+    X_resampled, y_resampled = smote.fit_resample(X_sample, y_sample)
+    
+    # Standardize features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_resampled)
+    joblib.dump(scaler, "scaler.pkl")  # Save scaler
+    
+    # Save transaction counts for testing
+    joblib.dump(orig_counts, "orig_counts.pkl")
+    joblib.dump(dest_counts, "dest_counts.pkl")
+    
+    # Save feature order
+    joblib.dump(X.columns.tolist(), "feature_order.pkl")
+    
+    return X_scaled, y_resampled
+
+# Train Model
+def train_model(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    model = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42, n_jobs=2)
+    model.fit(X_train, y_train)
+    
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+    
+    print("Classification Report:\n", classification_report(y_test, y_pred))
+    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+    print("ROC-AUC Score:", roc_auc_score(y_test, y_prob))
+    
+    # Cross-validation
+    scores = cross_val_score(model, X_train, y_train, cv=5, scoring='roc_auc')
+    print("Cross-Validation AUC Scores:", scores)
+    print("Mean AUC Score:", np.mean(scores))
+    
+    joblib.dump(model, "fraud_model.pkl")  # Save model
+    return model
+
+# Load and Train
+filepath = "Fraud.csv"  # Update with actual path
+df = load_data(filepath)
+X, y = preprocess_data(df)
+model = train_model(X, y)
+
+# Load model for testing
+model = joblib.load("fraud_model.pkl")
+scaler = joblib.load("scaler.pkl")
+orig_counts = joblib.load("orig_counts.pkl")
+dest_counts = joblib.load("dest_counts.pkl")
+feature_order = joblib.load("feature_order.pkl")
+
+# Function to test single transactions
+def predict_single(sample):
+    sample_df = pd.DataFrame([sample])
+    sample_df['type'] = sample_df['type'].astype('category').cat.codes
+    
+    # Add transaction count features
+    sample_df['orig_count'] = orig_counts.get(sample_df['nameOrig'].values[0], 0)
+    sample_df['dest_count'] = dest_counts.get(sample_df['nameDest'].values[0], 0)
+    
+    # Ensure 'isFlaggedFraud' exists in test data
+    if 'isFlaggedFraud' not in sample_df.columns:
+        sample_df['isFlaggedFraud'] = 0
+    
+    float_cols = ['amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'orig_count', 'dest_count', 'isFlaggedFraud']
+    sample_df[float_cols] = sample_df[float_cols].astype(np.float32)
+    
+    sample_df = sample_df.drop(columns=['nameOrig', 'nameDest'], errors='ignore')
+    
+    # Reorder test features to match training
+    sample_df = sample_df[feature_order]
+    
+    # Standardize
+    sample_scaled = scaler.transform(sample_df)
+    
+    # Predict
+    probability = model.predict_proba(sample_scaled)[0][1]
+    prediction = "Fraud" if probability > 0.05 else "Not Fraud"
+    
+    return prediction, probability
+
+# Test Cases
+test_samples = [
+    {
+        "step": 5,
+        "type": "TRANSFER",
+        "amount": 50000.0,
+        "oldbalanceOrg": 100000.0,
+        "newbalanceOrig": 50000.0,
+        "oldbalanceDest": 200000.0,
+        "newbalanceDest": 250000.0,
+        "nameOrig": "C12345",
+        "nameDest": "M67890"
+    },
+    {
+        "step": 10,
+        "type": "TRANSFER",
+        "amount": 5000000.0,
+        "oldbalanceOrg": 10000000.0,
+        "newbalanceOrig": 5000000.0,
+        "oldbalanceDest": 50000000.0,
+        "newbalanceDest": 55000000.0,
+        "nameOrig": "M67890",
+        "nameDest": "C12345"
+    }
+]
+
+# Run tests
+for i, sample in enumerate(test_samples):
+    prediction, prob = predict_single(sample)
+    print(f"Test {i+1}: Prediction: {prediction}, Probability: {prob:.4f}")
